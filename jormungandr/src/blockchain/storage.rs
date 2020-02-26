@@ -16,6 +16,7 @@ use std::error::Error;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 const BLOCK_STREAM_BUFFER_SIZE: usize = 32;
 
@@ -25,7 +26,11 @@ const PUMP_PRESSURE_MARGIN: usize = 4;
 
 pub use chain_storage_sqlite_old::Error as StorageError;
 
-async fn run_blocking_with_connection<F, T, E>(pool: Pool<ConnectionManager>, f: F) -> Result<T, E>
+async fn run_blocking_with_connection<F, T, E>(
+    logger: Logger,
+    pool: Pool<ConnectionManager>,
+    f: F,
+) -> Result<T, E>
 where
     F: FnOnce(&mut NodeStorageConnection) -> Result<T, E>,
     F: Send + 'static,
@@ -36,13 +41,22 @@ where
         let mut connection = pool
             .get()
             .map_err(|e| StorageError::BackendError(e.into()))?;
-        f(&mut connection)
+        let begin = Instant::now();
+        let res = f(&mut connection);
+        let duration = Instant::now() - begin;
+        trace!(
+            logger,
+            "storage connection released in {} ms",
+            duration.as_millis()
+        );
+        res
     })
     .await
     .unwrap()
 }
 
 async fn pump_block_sink<T, F>(
+    logger: &Logger,
     iter: Box<BlockIterState<T, F>>,
     pool: &Pool<ConnectionManager>,
     sink: &mut ReplyStreamHandle03<T>,
@@ -53,7 +67,7 @@ where
     T: Send + 'static,
 {
     let mut sink1 = sink.clone();
-    match run_blocking_with_connection(pool.clone(), move |connection| {
+    match run_blocking_with_connection(logger.clone(), pool.clone(), move |connection| {
         iter.fill_sink(connection, &mut sink1)
             .map_err(StreamingError::Sending)
     })
@@ -163,7 +177,7 @@ impl Storage03 {
         T: Send + 'static,
         E: Error + From<StorageError> + Send + 'static,
     {
-        run_blocking_with_connection(self.pool.clone(), f).await
+        run_blocking_with_connection(self.logger.clone(), self.pool.clone(), f).await
     }
 
     pub async fn get_tag(&self, tag: String) -> Result<Option<HeaderHash>, StorageError> {
@@ -240,17 +254,19 @@ impl Storage03 {
         let (rh, rs) = intercom::stream_reply03(BLOCK_STREAM_BUFFER_SIZE, self.logger.clone());
 
         struct PumpState<F> {
+            logger: Logger,
             iter: Box<BlockIterState<Block, F>>,
             pool: Pool<ConnectionManager>,
             handle: ReplyStreamHandle03<Block>,
         }
         let state = PumpState {
+            logger: self.logger.clone(),
             iter,
             pool: self.pool.clone(),
             handle: rh,
         };
         let pump = stream::unfold(state, |mut state| async move {
-            match pump_block_sink(state.iter, &state.pool, &mut state.handle)
+            match pump_block_sink(&state.logger, state.iter, &state.pool, &mut state.handle)
                 .await
                 .unwrap_or_else(|e| panic!("unexpected channel error: {:?}", e))
             {
@@ -313,7 +329,7 @@ impl Storage03 {
         match res {
             Ok(mut iter) => {
                 while let BlockIteration::Continue(new_iter_state) =
-                    pump_block_sink(iter, &self.pool, &mut sink).await?
+                    pump_block_sink(&self.logger, iter, &self.pool, &mut sink).await?
                 {
                     iter = new_iter_state;
                 }
